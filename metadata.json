@@ -1,0 +1,6 @@
+{
+  "name": "OREO",
+  "description": "A real-time voice-to-voice interactive Holographic Anime AI Avatar with low latency Gemini Live audio streaming, audio-reactive lip synchronization, facial rigging, universal workspace, and persistent memory.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
