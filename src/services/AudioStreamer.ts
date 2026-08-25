@@ -25,11 +25,10 @@ export class AudioStreamer {
   // Voice Activity Detection & Noise Gate state
   private isUserSpeaking: boolean = false;
   private lastSpeechTimestamp: number = 0;
-  private noiseFloor: number = 0.012; // Initial ambient noise floor baseline
-  private preRollBuffer: string[] = []; // Circular buffer to preserve syllable onsets (2-3 chunks)
+  private noiseFloor: number = 0.012; // Ambient noise floor baseline
   private responseSpeedMode: ResponseSpeedMode = 'turbo'; // 'turbo' (ultra-fast) or 'balanced'
-  private speechHangoverMs: number = 320; // Fast response default ms
-  private speechThresholdOffset: number = 0.016; // Sensitive instant onset detection
+  private speechHangoverMs: number = 320; // Turn turnaround threshold
+  private speechThresholdOffset: number = 0.016; // Instant onset detection
 
   constructor(
     onAudioChunk?: (base64Pcm: string) => void,
@@ -75,11 +74,25 @@ export class AudioStreamer {
     if (onSpeechEnd) this.onSpeechEnd = onSpeechEnd;
   }
 
+  public async checkMicrophonePermission(): Promise<'granted' | 'denied' | 'prompt' | 'unsupported'> {
+    if (typeof navigator === 'undefined' || !navigator.permissions || !navigator.permissions.query) {
+      return 'unsupported';
+    }
+    try {
+      const permissionStatus = await navigator.permissions.query({ name: 'microphone' as any });
+      return permissionStatus.state;
+    } catch {
+      return 'unsupported';
+    }
+  }
+
   public async start(): Promise<void> {
     if (this.isStreaming) return;
 
     if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Microphone access is not supported by your browser or environment.');
+      const err = new Error('Microphone access is not supported by your browser or environment.');
+      err.name = 'NotSupportedError';
+      throw err;
     }
 
     try {
@@ -119,7 +132,7 @@ export class AudioStreamer {
       this.analyserNode.smoothingTimeConstant = 0.4;
       this.sourceNode.connect(this.analyserNode);
 
-      // ScriptProcessor for 1024 samples (~64ms ultra-responsive chunks at 16kHz)
+      // ScriptProcessor for 1024 samples (~64ms chunks at 16kHz)
       this.processorNode = this.audioContext.createScriptProcessor(1024, 1, 1);
 
       this.processorNode.onaudioprocess = (e: AudioProcessingEvent) => {
@@ -152,7 +165,7 @@ export class AudioStreamer {
 
         if (!pcm16Base64) return;
 
-        // 4. ALWAYS emit audio chunk to Gemini Live API so the server receives continuous stream
+        // 4. Emit audio chunk to Gemini Live API
         if (this.onAudioChunk) {
           this.onAudioChunk(pcm16Base64);
         }
@@ -183,9 +196,29 @@ export class AudioStreamer {
 
       this.isStreaming = true;
       this.startVolumeMonitoring();
-    } catch (err) {
-      console.error('[AudioStreamer] Failed to initialize microphone:', err);
+    } catch (err: any) {
       this.stop();
+      const errName = err?.name || '';
+      const errMsg = (err?.message || '').toLowerCase();
+
+      if (
+        errName === 'NotAllowedError' ||
+        errName === 'SecurityError' ||
+        errMsg.includes('permission denied') ||
+        errMsg.includes('permission')
+      ) {
+        const customErr = new Error('Microphone permission was denied. Please allow microphone access in your browser to speak with OREO.');
+        customErr.name = 'NotAllowedError';
+        throw customErr;
+      } else if (errName === 'NotFoundError' || errMsg.includes('not found')) {
+        const customErr = new Error('No microphone device was found on this system.');
+        customErr.name = 'NotFoundError';
+        throw customErr;
+      } else if (errName === 'NotReadableError' || errMsg.includes('hardware')) {
+        const customErr = new Error('Microphone is busy or locked by another application.');
+        customErr.name = 'NotReadableError';
+        throw customErr;
+      }
       throw err;
     }
   }
@@ -247,7 +280,6 @@ export class AudioStreamer {
   public stop(): void {
     this.isStreaming = false;
     this.isUserSpeaking = false;
-    this.preRollBuffer = [];
 
     if (this.volumeIntervalId) {
       clearInterval(this.volumeIntervalId);

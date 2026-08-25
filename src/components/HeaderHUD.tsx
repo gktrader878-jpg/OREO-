@@ -1,21 +1,26 @@
 import React from 'react';
-import { Brain, Settings, Sliders, Radio, Activity, Zap } from 'lucide-react';
+import { Brain, Settings, Sliders, Radio, Activity, Zap, Bot } from 'lucide-react';
 import { AssistantState, SessionTelemetry } from '../types';
+import { AgentStatus } from '../agent/AgentTypes';
 
 interface HeaderHUDProps {
   state: AssistantState;
   telemetry: SessionTelemetry;
   memoryCount?: number;
+  agentStatus?: AgentStatus;
   onOpenSettings: () => void;
   onOpenMemory?: () => void;
+  onOpenAgent?: () => void;
 }
 
 export const HeaderHUD: React.FC<HeaderHUDProps> = ({
   state,
   telemetry,
   memoryCount = 0,
+  agentStatus = 'idle',
   onOpenSettings,
   onOpenMemory,
+  onOpenAgent,
 }) => {
   const getStatusLabel = () => {
     switch (state) {
@@ -101,6 +106,28 @@ export const HeaderHUD: React.FC<HeaderHUDProps> = ({
             {telemetry.responseSpeedMode === 'balanced' ? 'Balanced' : 'Turbo Low-Latency'}
           </span>
         </div>
+
+        {/* Agent Panel Trigger */}
+        {onOpenAgent && (
+          <button
+            onClick={onOpenAgent}
+            id="btn-header-agent"
+            title="Open OREO Autonomous Agent Engine"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border transition-all text-xs font-mono font-bold ${
+              agentStatus === 'executing' || agentStatus === 'planning' || agentStatus === 'verifying'
+                ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 animate-pulse shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                : agentStatus === 'waiting_confirmation'
+                ? 'bg-amber-500/20 border-amber-400 text-amber-300 animate-pulse'
+                : 'bg-white/5 border-white/10 hover:bg-cyan-500/10 hover:border-cyan-500/30 text-zinc-300 hover:text-white'
+            }`}
+          >
+            <Bot className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="hidden sm:inline">AGENT</span>
+            {agentStatus !== 'idle' && (
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+            )}
+          </button>
+        )}
 
         {/* Quick Memory Core Button */}
         {onOpenMemory && (

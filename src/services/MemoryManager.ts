@@ -5,17 +5,42 @@ export type MemoryEventListener = (event: {
   data?: any;
 }) => void;
 
-const DB_NAME = 'oreo_memory_db';
-const DB_VERSION = 1;
-const STORE_NAME = 'memories';
-const LOCAL_STORAGE_KEY = 'oreo_longterm_memories_fallback';
+export interface MemoryDebugInfo {
+  storage: string;
+  key: string;
+  databaseName: string;
+  storeName: string;
+  isIndexedDbSupported: boolean;
+  isDbConnected: boolean;
+  totalMemoriesCount: number;
+  lastOperation: 'SAVE' | 'SEARCH' | 'UPDATE' | 'DELETE' | 'CLEAR' | 'INIT';
+  lastResult: 'SUCCESS' | 'FAILED';
+  lastMemoryId: string | null;
+  lastError: string | null;
+  lastTimestamp: number;
+}
+
+const STORAGE_KEY = 'OREO_MEMORIES';
+const OLD_FALLBACK_KEY = 'oreo_longterm_memories_fallback';
 
 export class MemoryManager {
   private static instance: MemoryManager | null = null;
-  private memoriesCache: Map<string, MemoryItem> = new Map();
-  private isInitialized: boolean = false;
-  private db: IDBDatabase | null = null;
   private listeners: Set<MemoryEventListener> = new Set();
+
+  private debugInfo: MemoryDebugInfo = {
+    storage: 'localStorage',
+    key: STORAGE_KEY,
+    databaseName: 'localStorage (OREO_MEMORIES)',
+    storeName: STORAGE_KEY,
+    isIndexedDbSupported: false,
+    isDbConnected: true,
+    totalMemoriesCount: 0,
+    lastOperation: 'INIT',
+    lastResult: 'SUCCESS',
+    lastMemoryId: null,
+    lastError: null,
+    lastTimestamp: Date.now(),
+  };
 
   // Short-term conversation context (active session only)
   private conversationContext: ConversationMemoryContext = {
@@ -35,499 +60,397 @@ export class MemoryManager {
   }
 
   constructor() {
-    this.init();
+    this.migrateOldStorageIfNeeded();
+    this.updateStatsDebug('INIT', 'SUCCESS');
   }
 
-  /**
-   * Initializes IndexedDB with automatic schema creation and robust dual-storage persistence.
-   */
-  public async init(): Promise<void> {
-    if (this.isInitialized) return;
-
+  private migrateOldStorageIfNeeded(): void {
+    if (typeof localStorage === 'undefined') return;
     try {
-      // First load immediately from localStorage for zero-latency retrieval
-      this.loadFromLocalStorage();
-
-      if (typeof window !== 'undefined' && 'indexedDB' in window) {
-        this.db = await this.openDatabase();
-        const loadedFromIDB = await this.loadAllFromIndexedDB();
-        
-        // Merge IDB items with any localStorage items (preferring most recently updated)
-        for (const item of loadedFromIDB) {
-          const cached = this.memoriesCache.get(item.id);
-          if (!cached || item.updatedAt >= cached.updatedAt) {
-            this.memoriesCache.set(item.id, item);
+      const current = localStorage.getItem(STORAGE_KEY);
+      if (!current) {
+        const old = localStorage.getItem(OLD_FALLBACK_KEY);
+        if (old) {
+          try {
+            const parsed = JSON.parse(old);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+            }
+          } catch {
+            // Ignore parse error
           }
         }
-        
-        // Save back merged results to both stores
-        this.syncToLocalStorage();
-        for (const item of this.memoriesCache.values()) {
-          await this.saveItemToDb(item).catch(() => {});
-        }
       }
-    } catch (err) {
-      console.warn('[MemoryManager] Storage merge/init warning, continuing with localStorage:', err);
-      this.loadFromLocalStorage();
-    }
-
-    // Seed default knowledge if empty
-    if (this.memoriesCache.size === 0) {
-      await this.seedInitialMemories();
-    }
-
-    this.isInitialized = true;
-  }
-
-  private openDatabase(): Promise<IDBDatabase> {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-          store.createIndex('category', 'category', { unique: false });
-          store.createIndex('importance', 'importance', { unique: false });
-          store.createIndex('updatedAt', 'updatedAt', { unique: false });
-          store.createIndex('isExplicit', 'isExplicit', { unique: false });
-        }
-      };
-
-      request.onsuccess = (event) => {
-        resolve((event.target as IDBOpenDBRequest).result);
-      };
-
-      request.onerror = (event) => {
-        reject((event.target as IDBOpenDBRequest).error);
-      };
-    });
-  }
-
-  private loadAllFromIndexedDB(): Promise<MemoryItem[]> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        resolve([]);
-        return;
-      }
-
-      const tx = this.db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.getAll();
-
-      request.onsuccess = () => {
-        resolve((request.result as MemoryItem[]) || []);
-      };
-
-      request.onerror = () => {
-        reject(request.error);
-      };
-    });
-  }
-
-  private loadFromLocalStorage(): void {
-    try {
-      const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          this.memoriesCache.clear();
-          parsed.forEach((m) => this.memoriesCache.set(m.id, m));
-        }
-      }
-    } catch (err) {
-      console.error('[MemoryManager] Error reading localStorage fallback:', err);
+    } catch (e) {
+      console.warn('[OREO Memory] Storage migration notice:', e);
     }
   }
-
-  private syncToLocalStorage(): void {
-    try {
-      const list = Array.from(this.memoriesCache.values());
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(list));
-    } catch (err) {
-      console.error('[MemoryManager] Error saving to localStorage:', err);
-    }
-  }
-
-  private async saveItemToDb(item: MemoryItem): Promise<void> {
-    if (this.db) {
-      return new Promise((resolve, reject) => {
-        try {
-          const tx = this.db!.transaction(STORE_NAME, 'readwrite');
-          const store = tx.objectStore(STORE_NAME);
-          const req = store.put(item);
-          req.onsuccess = () => resolve();
-          req.onerror = () => reject(req.error);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    } else {
-      this.syncToLocalStorage();
-    }
-  }
-
-  private async deleteItemFromDb(id: string): Promise<void> {
-    if (this.db) {
-      return new Promise((resolve, reject) => {
-        try {
-          const tx = this.db!.transaction(STORE_NAME, 'readwrite');
-          const store = tx.objectStore(STORE_NAME);
-          const req = store.delete(id);
-          req.onsuccess = () => resolve();
-          req.onerror = () => reject(req.error);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    } else {
-      this.syncToLocalStorage();
-    }
-  }
-
-  private async clearDb(): Promise<void> {
-    if (this.db) {
-      return new Promise((resolve, reject) => {
-        try {
-          const tx = this.db!.transaction(STORE_NAME, 'readwrite');
-          const store = tx.objectStore(STORE_NAME);
-          const req = store.clear();
-          req.onsuccess = () => resolve();
-          req.onerror = () => reject(req.error);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    } else {
-      localStorage.removeItem(LOCAL_STORAGE_KEY);
-    }
-  }
-
-  private async seedInitialMemories(): Promise<void> {
-    const defaults: Omit<MemoryItem, 'id' | 'createdAt' | 'updatedAt'>[] = [
-      {
-        key: 'Project Name',
-        category: 'project',
-        content: "User is developing and interacting with the OREO AI Assistant system.",
-        importance: 0.9,
-        isExplicit: true,
-        tags: ['project', 'oreo', 'primary'],
-      },
-      {
-        key: 'Interface & Voice Preference',
-        category: 'preference',
-        content: 'Prefers ultra-low latency, real-time voice-to-voice interaction with concise responses.',
-        importance: 0.8,
-        isExplicit: true,
-        tags: ['voice', 'preference', 'speed'],
-      },
-    ];
-
-    for (const d of defaults) {
-      await this.addMemory(d);
-    }
-  }
-
-  public subscribe(listener: MemoryEventListener): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  private notify(event: {
-    type: 'memory_added' | 'memory_updated' | 'memory_deleted' | 'memory_cleared';
-    data?: any;
-  }): void {
-    this.listeners.forEach((l) => l(event));
-  }
-
-  // ----------------------------------------------------
-  // PUBLIC CRUD INTERFACE
-  // ----------------------------------------------------
 
   /**
-   * Adds a selective, valuable long-term memory.
+   * Safe synchronous reader of all memories from localStorage.
    */
-  public async addMemory(data: {
-    content: string;
-    category?: MemoryCategory;
-    key?: string;
-    importance?: number;
-    isExplicit?: boolean;
-    tags?: string[];
-  }): Promise<MemoryItem> {
-    await this.init();
+  public getAllMemories(): MemoryItem[] {
+    if (typeof localStorage === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed;
+    } catch (err) {
+      console.error('[OREO Memory] Error parsing OREO_MEMORIES from localStorage:', err);
+      return [];
+    }
+  }
 
-    // Check if an existing memory with a similar key or identical content already exists
-    const existing = Array.from(this.memoriesCache.values()).find(
-      (m) =>
-        (data.key && m.key && m.key.toLowerCase() === data.key.toLowerCase()) ||
-        m.content.toLowerCase().trim() === data.content.toLowerCase().trim()
-    );
+  /**
+   * Compatibility init method (instantaneous, never hangs).
+   */
+  public async init(): Promise<void> {
+    this.migrateOldStorageIfNeeded();
+    return Promise.resolve();
+  }
 
-    const now = Date.now();
+  /**
+   * Fetch a single memory by ID.
+   */
+  public getMemory(id: string): MemoryItem | null {
+    const memories = this.getAllMemories();
+    return memories.find((m) => m.id === id) || null;
+  }
 
-    if (existing) {
-      // Update existing memory instead of duplicating
-      const updated: MemoryItem = {
-        ...existing,
-        content: data.content,
-        category: data.category || existing.category,
-        key: data.key || existing.key,
-        importance: data.importance !== undefined ? data.importance : Math.max(existing.importance, 0.6),
-        isExplicit: data.isExplicit !== undefined ? data.isExplicit : existing.isExplicit,
-        tags: data.tags || existing.tags,
-        updatedAt: now,
-        accessCount: (existing.accessCount || 0) + 1,
-      };
-
-      this.memoriesCache.set(updated.id, updated);
-      await this.saveItemToDb(updated);
-      this.syncToLocalStorage();
-
-      this.notify({ type: 'memory_updated', data: updated });
-      return updated;
+  /**
+   * Save a new memory or replace an existing memory in localStorage.
+   * Synchronously writes to localStorage and verifies existence.
+   */
+  public saveMemory(memoryData: Partial<MemoryItem> & { content: string }): MemoryItem {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is not available in this environment.');
     }
 
-    const newId = `mem_${now.toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-    const newMemory: MemoryItem = {
-      id: newId,
-      key: data.key || this.deriveKeyFromContent(data.content, data.category || 'other'),
-      category: data.category || 'other',
-      content: data.content.trim(),
-      importance: data.importance !== undefined ? Math.min(1.0, Math.max(0.1, data.importance)) : 0.7,
-      isExplicit: data.isExplicit !== undefined ? data.isExplicit : true,
-      tags: data.tags || [],
-      createdAt: now,
+    const content = (memoryData.content || '').trim();
+    if (!content) {
+      throw new Error('Memory content is required.');
+    }
+
+    const now = new Date().toISOString();
+    const id = memoryData.id || `mem_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const title = memoryData.title || memoryData.key || '';
+    const isExplicit = memoryData.isExplicit !== undefined ? memoryData.isExplicit : (memoryData.source !== 'automatic');
+    const source = memoryData.source || (isExplicit ? 'explicit' : 'automatic');
+
+    const memoryItem: MemoryItem = {
+      id,
+      key: title,
+      title: title,
+      content,
+      category: memoryData.category || 'preference',
+      importance: typeof memoryData.importance === 'number' ? memoryData.importance : 0.8,
+      isExplicit,
+      source,
+      tags: Array.isArray(memoryData.tags) ? memoryData.tags : [],
+      createdAt: memoryData.createdAt || now,
       updatedAt: now,
-      accessCount: 1,
-      lastAccessedAt: now,
+      accessCount: (memoryData.accessCount || 0) + 1,
+      lastAccessedAt: Date.now(),
     };
 
-    this.memoriesCache.set(newMemory.id, newMemory);
-    await this.saveItemToDb(newMemory);
-    this.syncToLocalStorage();
+    try {
+      const memories = this.getAllMemories();
+      const existingIndex = memories.findIndex((m) => m.id === id);
 
-    this.notify({ type: 'memory_added', data: newMemory });
-    return newMemory;
-  }
+      if (existingIndex >= 0) {
+        memories[existingIndex] = {
+          ...memories[existingIndex],
+          ...memoryItem,
+          createdAt: memories[existingIndex].createdAt || memoryItem.createdAt,
+        };
+      } else {
+        memories.unshift(memoryItem);
+      }
 
-  private deriveKeyFromContent(content: string, category: MemoryCategory): string {
-    const lower = content.toLowerCase();
-    if (lower.includes('project')) return 'Project Detail';
-    if (lower.includes('name')) return 'User Name';
-    if (lower.includes('theme') || lower.includes('dark') || lower.includes('light')) return 'Theme Preference';
-    if (lower.includes('voice') || lower.includes('speed')) return 'Voice Setting';
-    if (category === 'identity') return 'User Identity';
-    if (category === 'preference') return 'User Preference';
-    if (category === 'project') return 'Project Context';
-    if (category === 'instruction') return 'Custom Rule';
-    if (category === 'habit') return 'User Habit';
-    return content.slice(0, 24) + (content.length > 24 ? '...' : '');
-  }
+      // Step 4: JSON.stringify and save
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(memories));
 
-  public async getMemory(id: string): Promise<MemoryItem | null> {
-    await this.init();
-    const item = this.memoriesCache.get(id);
-    if (item) {
-      item.accessCount = (item.accessCount || 0) + 1;
-      item.lastAccessedAt = Date.now();
-      await this.saveItemToDb(item);
-      return { ...item };
+      // Step 6 & 7: Read back and verify saved ID exists
+      const verifiedList = this.getAllMemories();
+      const verified = verifiedList.some((m) => m.id === id);
+
+      if (!verified) {
+        throw new Error('Memory verification failed: record was not found after saving.');
+      }
+
+      this.updateStatsDebug('SAVE', 'SUCCESS', id);
+      this.notifyListeners({ type: 'memory_added', data: memoryItem });
+
+      return memoryItem;
+    } catch (err: any) {
+      this.updateStatsDebug('SAVE', 'FAILED', id, err?.message || 'Save error');
+      console.error('[OREO Memory] Save failed:', err);
+      throw err;
     }
-    return null;
-  }
-
-  public async getAllMemories(): Promise<MemoryItem[]> {
-    await this.init();
-    return Array.from(this.memoriesCache.values()).sort((a, b) => b.updatedAt - a.updatedAt);
-  }
-
-  public async getMemoriesByCategory(category: MemoryCategory): Promise<MemoryItem[]> {
-    await this.init();
-    return Array.from(this.memoriesCache.values())
-      .filter((m) => m.category === category)
-      .sort((a, b) => b.importance - a.importance || b.updatedAt - a.updatedAt);
-  }
-
-  public async updateMemory(id: string, updates: Partial<MemoryItem>): Promise<MemoryItem | null> {
-    await this.init();
-    const existing = this.memoriesCache.get(id);
-    if (!existing) return null;
-
-    const updated: MemoryItem = {
-      ...existing,
-      ...updates,
-      id: existing.id,
-      createdAt: existing.createdAt,
-      updatedAt: Date.now(),
-    };
-
-    this.memoriesCache.set(id, updated);
-    await this.saveItemToDb(updated);
-    this.syncToLocalStorage();
-
-    this.notify({ type: 'memory_updated', data: updated });
-    return updated;
-  }
-
-  public async deleteMemory(id: string): Promise<boolean> {
-    await this.init();
-    if (!this.memoriesCache.has(id)) return false;
-
-    const item = this.memoriesCache.get(id);
-    this.memoriesCache.delete(id);
-    await this.deleteItemFromDb(id);
-    this.syncToLocalStorage();
-
-    this.notify({ type: 'memory_deleted', data: { id, item } });
-    return true;
   }
 
   /**
-   * Deletes memories matching natural language query (e.g. "dark theme", "project", "voice").
+   * Alias for saveMemory to maintain compatibility with existing callers.
    */
-  public async deleteMemoryByQuery(query: string): Promise<{ deletedCount: number; deletedItems: MemoryItem[] }> {
-    await this.init();
-    const q = query.toLowerCase().trim();
-    if (!q) return { deletedCount: 0, deletedItems: [] };
+  public async addMemory(memoryData: Partial<MemoryItem> & { content: string }): Promise<MemoryItem> {
+    return this.saveMemory(memoryData);
+  }
 
-    const matching: MemoryItem[] = [];
+  /**
+   * Update an existing memory item.
+   */
+  public updateMemory(id: string, updates: Partial<MemoryItem>): MemoryItem | null {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is not available.');
+    }
 
-    for (const item of this.memoriesCache.values()) {
-      if (
-        item.id.toLowerCase() === q ||
-        (item.key && item.key.toLowerCase().includes(q)) ||
-        item.content.toLowerCase().includes(q) ||
-        (item.tags && item.tags.some((t) => t.toLowerCase().includes(q)))
-      ) {
-        matching.push(item);
+    try {
+      const memories = this.getAllMemories();
+      const index = memories.findIndex((m) => m.id === id);
+
+      if (index === -1) {
+        this.updateStatsDebug('UPDATE', 'FAILED', id, 'Memory not found');
+        return null;
+      }
+
+      const existing = memories[index];
+      const now = new Date().toISOString();
+
+      const updatedItem: MemoryItem = {
+        ...existing,
+        ...updates,
+        id: existing.id,
+        key: updates.title !== undefined ? updates.title : (updates.key !== undefined ? updates.key : existing.key),
+        title: updates.title !== undefined ? updates.title : (updates.key !== undefined ? updates.key : existing.title),
+        content: (updates.content !== undefined ? updates.content : existing.content).trim(),
+        category: updates.category || existing.category,
+        importance: updates.importance !== undefined ? updates.importance : existing.importance,
+        isExplicit: updates.isExplicit !== undefined ? updates.isExplicit : existing.isExplicit,
+        tags: updates.tags || existing.tags || [],
+        updatedAt: now,
+        lastAccessedAt: Date.now(),
+      };
+
+      memories[index] = updatedItem;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(memories));
+
+      // Verification
+      const verifiedList = this.getAllMemories();
+      const verified = verifiedList.find((m) => m.id === id);
+
+      if (!verified || verified.updatedAt !== now) {
+        throw new Error('Verification failed after memory update.');
+      }
+
+      this.updateStatsDebug('UPDATE', 'SUCCESS', id);
+      this.notifyListeners({ type: 'memory_updated', data: updatedItem });
+
+      return updatedItem;
+    } catch (err: any) {
+      this.updateStatsDebug('UPDATE', 'FAILED', id, err?.message || 'Update error');
+      console.error('[OREO Memory] Update failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Delete a memory by ID.
+   */
+  public deleteMemory(id: string): boolean {
+    if (typeof localStorage === 'undefined') return false;
+
+    try {
+      const memories = this.getAllMemories();
+      const initialLength = memories.length;
+      const filtered = memories.filter((m) => m.id !== id);
+
+      if (filtered.length === initialLength) {
+        return false;
+      }
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(filtered));
+
+      // Verification
+      const verified = this.getAllMemories().every((m) => m.id !== id);
+      if (!verified) {
+        throw new Error('Memory deletion verification failed.');
+      }
+
+      this.updateStatsDebug('DELETE', 'SUCCESS', id);
+      this.notifyListeners({ type: 'memory_deleted', data: { id } });
+
+      return true;
+    } catch (err: any) {
+      this.updateStatsDebug('DELETE', 'FAILED', id, err?.message || 'Delete error');
+      console.error('[OREO Memory] Delete failed:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Clear all memories from storage.
+   */
+  public clearAllMemories(): boolean {
+    if (typeof localStorage === 'undefined') return false;
+
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(OLD_FALLBACK_KEY);
+
+      const verified = localStorage.getItem(STORAGE_KEY) === null;
+      if (!verified) {
+        throw new Error('Verification failed: memories still present.');
+      }
+
+      this.updateStatsDebug('CLEAR', 'SUCCESS');
+      this.notifyListeners({ type: 'memory_cleared' });
+
+      return true;
+    } catch (err: any) {
+      this.updateStatsDebug('CLEAR', 'FAILED', null, err?.message || 'Clear error');
+      console.error('[OREO Memory] Clear failed:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Alias for clearAllMemories.
+   */
+  public async clearMemory(): Promise<boolean> {
+    return this.clearAllMemories();
+  }
+
+  /**
+   * Search memories matching a query string across title, key, content, category, and tags.
+   */
+  public searchMemories(query: string, category?: string): MemoryItem[] {
+    const rawMemories = this.getAllMemories();
+    const cleanQuery = (query || '').trim().toLowerCase();
+
+    this.updateStatsDebug('SEARCH', 'SUCCESS');
+
+    if (!cleanQuery) {
+      if (category && category !== 'all') {
+        return rawMemories.filter((m) => m.category === category);
+      }
+      return rawMemories;
+    }
+
+    const filtered = rawMemories.filter((m) => {
+      if (category && category !== 'all' && m.category !== category) {
+        return false;
+      }
+
+      const matchContent = m.content.toLowerCase().includes(cleanQuery);
+      const matchKey = (m.key || '').toLowerCase().includes(cleanQuery);
+      const matchTitle = (m.title || '').toLowerCase().includes(cleanQuery);
+      const matchCategory = m.category.toLowerCase().includes(cleanQuery);
+      const matchTags = m.tags?.some((t) => t.toLowerCase().includes(cleanQuery)) || false;
+
+      return matchContent || matchKey || matchTitle || matchCategory || matchTags;
+    });
+
+    return filtered;
+  }
+
+  /**
+   * Alias for searchMemories.
+   */
+  public async searchMemory(query: string, category?: string): Promise<MemoryItem[]> {
+    return this.searchMemories(query, category);
+  }
+
+  /**
+   * Find only the most relevant memories for an assistant query, ranked by relevance.
+   */
+  public findRelevantMemories(query: string, limit: number = 5): MemoryItem[] {
+    const cleanQuery = (query || '').trim().toLowerCase();
+    if (!cleanQuery) return [];
+
+    const memories = this.getAllMemories();
+    const keywords = cleanQuery.split(/\s+/).filter((k) => k.length > 1);
+
+    const scored: { item: MemoryItem; score: number }[] = [];
+
+    for (const item of memories) {
+      let score = 0;
+      const contentLower = item.content.toLowerCase();
+      const titleLower = (item.title || item.key || '').toLowerCase();
+      const categoryLower = item.category.toLowerCase();
+      const tags = (item.tags || []).map((t) => t.toLowerCase());
+
+      // 1. Exact content match
+      if (contentLower.includes(cleanQuery)) {
+        score += 100;
+      }
+
+      // 2. Title match
+      if (titleLower && (titleLower.includes(cleanQuery) || cleanQuery.includes(titleLower))) {
+        score += 80;
+      }
+
+      // 3. Tag matches
+      for (const tag of tags) {
+        if (cleanQuery.includes(tag) || tag.includes(cleanQuery)) {
+          score += 50;
+        }
+      }
+
+      // 4. Category match
+      if (cleanQuery.includes(categoryLower)) {
+        score += 30;
+      }
+
+      // 5. Keyword matches
+      for (const kw of keywords) {
+        if (contentLower.includes(kw)) score += 15;
+        if (titleLower.includes(kw)) score += 20;
+        if (tags.some((t) => t.includes(kw))) score += 15;
+      }
+
+      // Importance boost
+      score += (item.importance || 0.5) * 10;
+      if (item.isExplicit) score += 10;
+
+      if (score > 0) {
+        scored.push({ item, score });
       }
     }
 
-    for (const item of matching) {
-      this.memoriesCache.delete(item.id);
-      await this.deleteItemFromDb(item.id);
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, limit).map((s) => s.item);
+  }
+
+  /**
+   * Delete memory items by natural query matching.
+   */
+  public async deleteMemoryByQuery(query: string): Promise<{ deletedCount: number; deletedIds: string[] }> {
+    const matches = this.findRelevantMemories(query, 5);
+    if (matches.length === 0) {
+      return { deletedCount: 0, deletedIds: [] };
     }
 
-    if (matching.length > 0) {
-      this.syncToLocalStorage();
-      this.notify({ type: 'memory_deleted', data: { items: matching } });
+    const deletedIds: string[] = [];
+    for (const match of matches) {
+      if (this.deleteMemory(match.id)) {
+        deletedIds.push(match.id);
+      }
     }
 
     return {
-      deletedCount: matching.length,
-      deletedItems: matching,
+      deletedCount: deletedIds.length,
+      deletedIds,
     };
   }
 
-  public async clearMemory(): Promise<void> {
-    await this.init();
-    this.memoriesCache.clear();
-    await this.clearDb();
-    this.syncToLocalStorage();
-    this.notify({ type: 'memory_cleared' });
-  }
-
   /**
-   * Search memory with query and optional category filter.
+   * Get memory statistics.
    */
-  public async searchMemory(query: string, category?: MemoryCategory | 'all'): Promise<MemoryItem[]> {
-    await this.init();
-    const q = (query || '').toLowerCase().trim();
-
-    let items = Array.from(this.memoriesCache.values());
-
-    if (category && category !== 'all') {
-      items = items.filter((m) => m.category === category);
-    }
-
-    if (!q) {
-      return this.rankMemories(items);
-    }
-
-    const filtered = items.filter((item) => {
-      const matchKey = item.key?.toLowerCase().includes(q) || false;
-      const matchContent = item.content.toLowerCase().includes(q);
-      const matchTags = item.tags?.some((t) => t.toLowerCase().includes(q)) || false;
-      const matchCat = item.category.toLowerCase().includes(q);
-      return matchKey || matchContent || matchTags || matchCat;
-    });
-
-    return this.rankMemories(filtered, q);
-  }
-
-  /**
-   * Ranks memories using:
-   * 1. Explicitly saved memories
-   * 2. Current project information
-   * 3. User preferences
-   * 4. High importance weighting (0.1 - 1.0)
-   * 5. Recency
-   */
-  public rankMemories(memories: MemoryItem[], contextQuery?: string): MemoryItem[] {
-    const q = contextQuery ? contextQuery.toLowerCase().trim() : '';
-
-    return [...memories].sort((a, b) => {
-      let scoreA = a.importance * 10;
-      let scoreB = b.importance * 10;
-
-      if (a.isExplicit) scoreA += 5;
-      if (b.isExplicit) scoreB += 5;
-
-      if (a.category === 'identity') scoreA += 4;
-      if (b.category === 'identity') scoreB += 4;
-
-      if (a.category === 'project') scoreA += 3;
-      if (b.category === 'project') scoreB += 3;
-
-      if (a.category === 'preference') scoreA += 2;
-      if (b.category === 'preference') scoreB += 2;
-
-      if (q) {
-        if (a.key && a.key.toLowerCase().includes(q)) scoreA += 8;
-        if (b.key && b.key.toLowerCase().includes(q)) scoreB += 8;
-        if (a.content.toLowerCase().includes(q)) scoreA += 5;
-        if (b.content.toLowerCase().includes(q)) scoreB += 5;
-      }
-
-      // Recency tie-breaker
-      if (scoreA === scoreB) {
-        return b.updatedAt - a.updatedAt;
-      }
-
-      return scoreB - scoreA;
-    });
-  }
-
-  /**
-   * Selectively retrieves the most relevant memories for the active conversation topic.
-   */
-  public async retrieveRelevantMemories(topicOrQuery?: string, limit: number = 6): Promise<MemoryItem[]> {
-    await this.init();
-    const ranked = await this.searchMemory(topicOrQuery || '');
-    return ranked.slice(0, limit);
-  }
-
-  /**
-   * Generates a clean markdown/text summary of relevant memories for model context.
-   */
-  public async formatMemoriesForContext(topicOrQuery?: string, limit: number = 5): Promise<string> {
-    const relevant = await this.retrieveRelevantMemories(topicOrQuery, limit);
-    if (relevant.length === 0) return '';
-
-    return relevant
-      .map(
-        (m) =>
-          `• [${m.category.toUpperCase()}] ${m.key ? m.key + ': ' : ''}${m.content}`
-      )
-      .join('\n');
-  }
-
-  public async getStats(): Promise<MemoryStats> {
-    await this.init();
-    const all = Array.from(this.memoriesCache.values());
-
-    const counts: Record<MemoryCategory, number> = {
+  public getStats(): MemoryStats {
+    const memories = this.getAllMemories();
+    const categoryCounts: Record<MemoryCategory, number> = {
       identity: 0,
       preference: 0,
       project: 0,
@@ -537,111 +460,141 @@ export class MemoryManager {
       other: 0,
     };
 
-    let highCount = 0;
+    let highImportanceCount = 0;
 
-    for (const item of all) {
-      if (counts[item.category] !== undefined) {
-        counts[item.category]++;
+    for (const m of memories) {
+      if (categoryCounts[m.category] !== undefined) {
+        categoryCounts[m.category]++;
       } else {
-        counts.other++;
+        categoryCounts.other++;
       }
-      if (item.importance >= 0.75) {
-        highCount++;
+
+      if (m.importance >= 0.8) {
+        highImportanceCount++;
       }
     }
 
     return {
-      totalCount: all.length,
-      categoryCounts: counts,
-      highImportanceCount: highCount,
+      totalCount: memories.length,
+      categoryCounts,
+      highImportanceCount,
     };
   }
 
-  public async exportJson(): Promise<string> {
-    await this.init();
-    const all = Array.from(this.memoriesCache.values());
-    return JSON.stringify(
-      {
-        exportedAt: new Date().toISOString(),
-        version: 1,
-        app: 'OREO AI Assistant',
-        memories: all,
-      },
-      null,
-      2
-    );
+  /**
+   * Developer debug info inspection.
+   */
+  public getDebugInfo(): MemoryDebugInfo {
+    const memories = this.getAllMemories();
+    this.debugInfo.totalMemoriesCount = memories.length;
+    return { ...this.debugInfo };
   }
 
-  public async importJson(jsonStr: string): Promise<number> {
-    await this.init();
-    try {
-      const parsed = JSON.parse(jsonStr);
-      const items: MemoryItem[] = Array.isArray(parsed) ? parsed : parsed.memories;
-      if (!Array.isArray(items)) throw new Error('Invalid JSON format: expected array of memories');
+  private updateStatsDebug(
+    op: 'SAVE' | 'SEARCH' | 'UPDATE' | 'DELETE' | 'CLEAR' | 'INIT',
+    res: 'SUCCESS' | 'FAILED',
+    memId: string | null = null,
+    err: string | null = null
+  ): void {
+    const total = this.getAllMemories().length;
+    this.debugInfo = {
+      storage: 'localStorage',
+      key: STORAGE_KEY,
+      databaseName: 'localStorage (OREO_MEMORIES)',
+      storeName: STORAGE_KEY,
+      isIndexedDbSupported: false,
+      isDbConnected: true,
+      totalMemoriesCount: total,
+      lastOperation: op,
+      lastResult: res,
+      lastMemoryId: memId,
+      lastError: err,
+      lastTimestamp: Date.now(),
+    };
+  }
 
-      let imported = 0;
-      for (const item of items) {
-        if (item.content) {
-          await this.addMemory({
-            content: item.content,
-            category: item.category || 'other',
-            key: item.key,
-            importance: item.importance,
-            isExplicit: item.isExplicit,
-            tags: item.tags,
-          });
-          imported++;
-        }
+  /**
+   * Export all memories as JSON formatted string.
+   */
+  public exportJson(): string {
+    const memories = this.getAllMemories();
+    return JSON.stringify(memories, null, 2);
+  }
+
+  /**
+   * Import memories from a JSON string.
+   */
+  public importJson(jsonStr: string): number {
+    if (typeof localStorage === 'undefined') throw new Error('localStorage not available');
+
+    const parsed = JSON.parse(jsonStr);
+    if (!Array.isArray(parsed)) {
+      throw new Error('Invalid JSON: expected an array of memory objects.');
+    }
+
+    let count = 0;
+    for (const item of parsed) {
+      if (item && typeof item.content === 'string' && item.content.trim()) {
+        this.saveMemory(item);
+        count++;
       }
-      return imported;
-    } catch (err) {
-      console.error('[MemoryManager] Failed to import JSON:', err);
-      throw err;
     }
+
+    return count;
   }
 
-  // ----------------------------------------------------
-  // CURRENT CONVERSATION MEMORY (SESSION CONTEXT ONLY)
-  // ----------------------------------------------------
-
-  public setSessionTopic(topic: string): void {
-    if (!topic || topic.trim() === '') return;
-    this.conversationContext.currentTopic = topic;
-    if (!this.conversationContext.recentTopics.includes(topic)) {
-      this.conversationContext.recentTopics.unshift(topic);
-      if (this.conversationContext.recentTopics.length > 5) {
-        this.conversationContext.recentTopics.pop();
-      }
-    }
-    this.conversationContext.lastUpdated = Date.now();
-  }
-
-  public setActiveProject(projectName: string): void {
-    this.conversationContext.activeProjectName = projectName;
-    this.conversationContext.lastUpdated = Date.now();
-  }
-
-  public addTemporaryContext(detail: string): void {
-    if (!detail) return;
-    this.conversationContext.temporaryContext.push(detail);
-    if (this.conversationContext.temporaryContext.length > 10) {
-      this.conversationContext.temporaryContext.shift();
-    }
-    this.conversationContext.lastUpdated = Date.now();
-  }
-
-  public getSessionContext(): ConversationMemoryContext {
+  /**
+   * Get short-term session context.
+   */
+  public getConversationContext(): ConversationMemoryContext {
     return { ...this.conversationContext };
   }
 
-  public clearSessionContext(): void {
+  /**
+   * Update short-term session context.
+   */
+  public updateConversationContext(updates: Partial<ConversationMemoryContext>): void {
     this.conversationContext = {
-      currentTopic: undefined,
-      activeProjectName: undefined,
-      recentTopics: [],
-      sessionPreferences: {},
-      temporaryContext: [],
+      ...this.conversationContext,
+      ...updates,
       lastUpdated: Date.now(),
     };
+  }
+
+  /**
+   * Format long-term memories for AI prompt injection.
+   */
+  public getMemoriesForPrompt(): string {
+    const memories = this.getAllMemories();
+    if (memories.length === 0) return 'No stored user memories.';
+
+    // Sort by importance descending
+    const sorted = [...memories].sort((a, b) => (b.importance || 0.5) - (a.importance || 0.5));
+    return sorted
+      .map((m) => `- [${m.category.toUpperCase()}] ${m.key || m.title ? `${m.key || m.title}: ` : ''}${m.content}`)
+      .join('\n');
+  }
+
+  /**
+   * Subscribe to memory mutation events.
+   */
+  public subscribe(listener: MemoryEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notifyListeners(event: {
+    type: 'memory_added' | 'memory_updated' | 'memory_deleted' | 'memory_cleared';
+    data?: any;
+  }): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch (err) {
+        console.error('[OREO Memory] Listener error:', err);
+      }
+    }
   }
 }

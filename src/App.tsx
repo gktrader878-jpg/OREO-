@@ -1,18 +1,22 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, ExternalLink, MicOff, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, ExternalLink, MicOff, RefreshCw, X, MessageSquare } from 'lucide-react';
 import { ActiveToolsHUD } from './components/ActiveToolsHUD';
-import { AppWorkspace } from './components/AppWorkspace';
+import { BrowserWorkspace } from './components/BrowserWorkspace';
 import { AudioWaveform } from './components/AudioWaveform';
 import { ControlDock } from './components/ControlDock';
 import { FuturisticBackground } from './components/FuturisticBackground';
 import { HeaderHUD } from './components/HeaderHUD';
 import { HolographicAvatar } from './components/HolographicAvatar';
 import { MemoryPanel } from './components/MemoryPanel';
+import { AgentPanel } from './components/AgentPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { AppController } from './services/AppController';
+import { BrowserController } from './browser/BrowserController';
 import { LiveSession } from './services/LiveSession';
 import { MemoryManager } from './services/MemoryManager';
 import { ToolManager } from './services/ToolManager';
+import { AgentEngine } from './agent/AgentEngine';
+import { AgentStatus } from './agent/AgentTypes';
 import { ActiveTimer, AssistantState, OpenedWebsite, ResponseSpeedMode, SessionTelemetry, ToolActionLog, VisualizerMode, VoiceOption, WorkspaceState } from './types';
 
 export default function App() {
@@ -27,6 +31,8 @@ export default function App() {
   const [visualizerMode, setVisualizerMode] = useState<VisualizerMode>('orb');
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
+  const [isAgentOpen, setIsAgentOpen] = useState<boolean>(false);
+  const [agentStatus, setAgentStatus] = useState<AgentStatus>(AgentEngine.getInstance().getStatus());
   const [memoryCount, setMemoryCount] = useState<number>(0);
   const [workspace, setWorkspace] = useState<WorkspaceState>(appController.getState());
 
@@ -92,12 +98,20 @@ export default function App() {
       refreshMemoryCount();
     });
 
+    const unsubAgent = AgentEngine.getInstance().subscribe((ev) => {
+      setAgentStatus(AgentEngine.getInstance().getStatus());
+      if (ev.type === 'waiting_confirmation') {
+        setIsAgentOpen(true); // Pop open modal so user can quickly review & approve
+      }
+    });
+
     return () => {
       unsubState();
       unsubTelemetry();
       unsubTools();
       unsubWorkspace();
       unsubMemory();
+      unsubAgent();
       liveSession.destroy();
       toolManager.destroy();
     };
@@ -108,7 +122,7 @@ export default function App() {
       try {
         await liveSession.connect(telemetry.currentVoice);
       } catch (err: any) {
-        console.error('Failed to initiate live session:', err);
+        console.warn('Failed to initiate live session:', err?.message || err);
       }
     } else {
       liveSession.disconnect();
@@ -118,12 +132,6 @@ export default function App() {
   const handleToggleMute = () => {
     const muted = liveSession.toggleMute();
     setIsMuted(muted);
-  };
-
-  const handleCycleVisualizerMode = () => {
-    const modes: VisualizerMode[] = ['orb', 'waveform', 'particles', 'cyberhud'];
-    const nextIndex = (modes.indexOf(visualizerMode) + 1) % modes.length;
-    setVisualizerMode(modes[nextIndex]);
   };
 
   const handleSelectVoice = (voice: VoiceOption) => {
@@ -139,13 +147,29 @@ export default function App() {
     setActiveTimers([...toolManager.getActiveTimers()]);
   };
 
+  const handleSendTextMessage = async (text: string) => {
+    try {
+      await liveSession.sendTextMessage(text);
+    } catch (err) {
+      console.warn('Failed to send text message:', err);
+    }
+  };
+
+  const [browserState, setBrowserState] = useState(BrowserController.getInstance().getState());
+
+  useEffect(() => {
+    const unsub = BrowserController.getInstance().subscribe((s) => setBrowserState(s));
+    return unsub;
+  }, []);
+
   const handleToggleWorkspace = () => {
-    if (workspace.isOpen && !workspace.isMinimized) {
-      appController.toggleMinimize();
-    } else if (workspace.isOpen && workspace.isMinimized) {
-      appController.toggleMinimize();
+    const bc = BrowserController.getInstance();
+    if (bc.getState().isOpen && !bc.getState().isMinimized) {
+      bc.toggleMinimize();
+    } else if (bc.getState().isOpen && bc.getState().isMinimized) {
+      bc.toggleMinimize();
     } else {
-      appController.openWorkspace();
+      bc.toggleWorkspace(true);
     }
   };
 
@@ -159,12 +183,14 @@ export default function App() {
         state={state}
         telemetry={telemetry}
         memoryCount={memoryCount}
+        agentStatus={agentStatus}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenMemory={() => setIsMemoryOpen(true)}
+        onOpenAgent={() => setIsAgentOpen(true)}
       />
 
-      {/* Central Universal App / Website Workspace */}
-      <AppWorkspace workspace={workspace} />
+      {/* Central Real Integrated Browser Workspace */}
+      <BrowserWorkspace browserState={browserState} />
 
       {/* Main Stage: Sleek Visualizer Orb & Responsive Waveform Spectrum */}
       <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-4 w-full max-w-4xl mx-auto my-auto">
@@ -183,14 +209,14 @@ export default function App() {
                 <div>
                   <p className="font-semibold text-red-300 text-sm mb-0.5">
                     {errorMessage.toLowerCase().includes('microphone')
-                      ? 'Microphone Access Required'
-                      : 'Connection Error'}
+                      ? 'Microphone Permission Required'
+                      : 'Connection Notice'}
                   </p>
                   <p className="text-zinc-300 leading-relaxed">{errorMessage}</p>
 
                   {errorMessage.toLowerCase().includes('microphone') && (
                     <p className="text-[11px] text-zinc-400 mt-1.5 border-t border-red-500/10 pt-1.5">
-                      💡 Tip: Click the lock icon in the browser URL bar to allow microphone access, or open the app in a standalone tab.
+                      💡 Tip: Allow microphone in browser URL settings, or open in a new tab to prompt for permission.
                     </p>
                   )}
                 </div>
@@ -217,7 +243,7 @@ export default function App() {
                 className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-medium text-[11px] flex items-center gap-1.5 transition-colors shadow-sm"
               >
                 <RefreshCw className="w-3 h-3" />
-                Try Again
+                Retry Mic Access
               </button>
             </div>
           </div>
@@ -253,15 +279,24 @@ export default function App() {
         <ControlDock
           state={state}
           isMuted={isMuted}
-          workspaceOpen={workspace.isOpen && !workspace.isMinimized}
+          workspaceOpen={browserState.isOpen && !browserState.isMinimized}
           memoryCount={memoryCount}
+          agentStatus={agentStatus}
           onToggleConnect={handleToggleConnect}
           onToggleMute={handleToggleMute}
           onToggleWorkspace={handleToggleWorkspace}
           onOpenSettings={() => setIsSettingsOpen(true)}
           onOpenMemory={() => setIsMemoryOpen(true)}
+          onOpenAgent={() => setIsAgentOpen(true)}
+          onSendTextMessage={handleSendTextMessage}
         />
       </footer>
+
+      {/* Autonomous Multi-Step Agent Engine Panel Modal */}
+      <AgentPanel
+        isOpen={isAgentOpen}
+        onClose={() => setIsAgentOpen(false)}
+      />
 
       {/* System Settings & Diagnostics Modal */}
       <SettingsModal

@@ -18,13 +18,15 @@ export type MemoryCategory =
 export interface MemoryItem {
   id: string;
   key?: string; // Short title or identifier (e.g. "Project Name", "Theme Preference", "User Name")
+  title?: string; // Alias for key/title
   category: MemoryCategory;
   content: string; // The factual memory content (e.g., "User's project is called OREO")
   importance: number; // 0.1 to 1.0 (e.g., 0.9 for project name, 0.7 for preference)
   isExplicit: boolean; // true if explicitly asked ("Remember that..."), false if auto-learned
+  source?: 'explicit' | 'automatic';
   tags?: string[];
-  createdAt: number;
-  updatedAt: number;
+  createdAt: number | string;
+  updatedAt: number | string;
   accessCount?: number;
   lastAccessedAt?: number;
 }

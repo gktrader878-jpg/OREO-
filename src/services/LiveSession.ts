@@ -1,6 +1,7 @@
 import { AssistantState, EmotionState, FunctionCall, ResponseSpeedMode, ServerMessage, SessionTelemetry, VoiceOption } from '../types';
 import { AudioPlayer } from './AudioPlayer';
 import { AudioStreamer } from './AudioStreamer';
+import { MemoryManager } from './MemoryManager';
 import { ToolManager } from './ToolManager';
 
 export type SessionStateListener = (state: AssistantState) => void;
@@ -16,6 +17,7 @@ export class LiveSession {
   private currentVoice: VoiceOption = 'Puck';
   private responseSpeedMode: ResponseSpeedMode = 'turbo';
   private errorMessage: string | null = null;
+  private isAudioInputActive: boolean = false;
 
   private stateListeners: Set<SessionStateListener> = new Set();
   private telemetryListeners: Set<TelemetryListener> = new Set();
@@ -77,7 +79,6 @@ export class LiveSession {
       () => {
         if (this.state === 'listening' && this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.setState('thinking');
-          // If no audio arrives within 4 seconds (model decides silence is appropriate), return cleanly to listening
           this.clearThinkingTimeout();
           this.thinkingTimeoutId = window.setTimeout(() => {
             if (this.state === 'thinking' && !this.audioPlayer.getIsPlaying()) {
@@ -94,6 +95,25 @@ export class LiveSession {
 
     this.toolManager.setEmotionChangeHandler((emotion) => {
       this.setEmotion(emotion);
+    });
+
+    MemoryManager.getInstance().subscribe(async () => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          const memories = await MemoryManager.getInstance().getAllMemories();
+          const memoryStrings = memories.map(
+            (m) => `• [${m.category.toUpperCase()}] ${m.key ? m.key + ': ' : ''}${m.content}`
+          );
+          this.ws.send(
+            JSON.stringify({
+              type: 'sync_memories',
+              memories: memoryStrings,
+            })
+          );
+        } catch (e) {
+          // ignore
+        }
+      }
     });
   }
 
@@ -139,7 +159,7 @@ export class LiveSession {
     return this.audioPlayer;
   }
 
-  public async connect(selectedVoice?: VoiceOption): Promise<void> {
+  public async connect(selectedVoice?: VoiceOption, options?: { skipMicrophone?: boolean }): Promise<void> {
     if (this.state === 'connecting' || this.state === 'listening' || this.state === 'thinking' || this.state === 'speaking') {
       return;
     }
@@ -155,24 +175,58 @@ export class LiveSession {
     this.sessionStartTime = Date.now();
 
     try {
-      // 1. Initialize Audio contexts & microphone
+      // 1. Initialize Audio playback context
       await this.audioPlayer.init();
-      await this.audioStreamer.start();
 
-      // 2. Establish WebSocket to backend live bridge
+      // 2. Initialize Microphone if not skipped
+      if (!options?.skipMicrophone) {
+        try {
+          await this.audioStreamer.start();
+          this.isAudioInputActive = true;
+        } catch (micErr: any) {
+          console.warn('[LiveSession] Microphone initialization deferred/denied:', micErr?.message || micErr);
+          this.isAudioInputActive = false;
+          // Re-throw so user is clearly notified of permission requirement
+          throw micErr;
+        }
+      } else {
+        this.isAudioInputActive = false;
+      }
+
+      // 3. Establish WebSocket to backend live bridge
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws/live`;
       console.log(`[LiveSession] Connecting to WebSocket endpoint: ${wsUrl}`);
 
       this.ws = new WebSocket(wsUrl);
 
-      this.ws.onopen = () => {
+      this.ws.onopen = async () => {
         console.log('[LiveSession] WebSocket connected');
         this.setState('listening');
         this.startTelemetryLoops();
 
-        if (this.currentVoice !== 'Puck') {
-          this.setVoice(this.currentVoice);
+        try {
+          const memoryManager = MemoryManager.getInstance();
+          await memoryManager.init();
+          const memories = await memoryManager.getAllMemories();
+          const memoryStrings = memories.map(
+            (m) => `• [${m.category.toUpperCase()}] ${m.key ? m.key + ': ' : ''}${m.content}`
+          );
+
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(
+              JSON.stringify({
+                type: 'init_context',
+                voice: this.currentVoice,
+                memories: memoryStrings,
+              })
+            );
+          }
+        } catch (err) {
+          console.warn('[LiveSession] Could not sync initial memories:', err);
+          if (this.currentVoice !== 'Puck') {
+            this.setVoice(this.currentVoice);
+          }
         }
       };
 
@@ -260,7 +314,6 @@ export class LiveSession {
         this.cleanup();
       };
     } catch (err: any) {
-      console.error('[LiveSession] Failed to connect:', err);
       const errMsg = (err?.message || '').toLowerCase();
       const errName = err?.name || '';
 
@@ -274,7 +327,7 @@ export class LiveSession {
         errMsg.includes('denied')
       ) {
         friendlyMsg =
-          'Microphone access is blocked. Please allow microphone permissions in your browser or open the app in a new window.';
+          'Microphone permission is required to talk to OREO. Please click Allow in your browser, or open in a new tab.';
       } else if (errName === 'NotFoundError' || errMsg.includes('not found') || errMsg.includes('no microphone')) {
         friendlyMsg = 'No microphone device was detected. Please connect a microphone and try again.';
       } else if (errName === 'NotReadableError' || errMsg.includes('busy') || errMsg.includes('hardware')) {
@@ -286,6 +339,39 @@ export class LiveSession {
       this.errorMessage = friendlyMsg;
       this.setState('error');
       this.cleanup();
+    }
+  }
+
+  public async sendTextMessage(text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // Connect if disconnected
+      await this.connect(this.currentVoice, { skipMicrophone: !this.isAudioInputActive });
+      // Wait for WS open with 3s timeout
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 50);
+        setTimeout(() => {
+          clearInterval(check);
+          resolve();
+        }, 3000);
+      });
+    }
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.setState('thinking');
+      const payload = JSON.stringify({
+        type: 'text',
+        text: trimmed,
+      });
+      this.ws.send(payload);
+      this.bytesSent += payload.length;
     }
   }
 
@@ -382,6 +468,7 @@ export class LiveSession {
 
     this.audioStreamer.stop();
     this.audioPlayer.stopAndClear();
+    this.isAudioInputActive = false;
   }
 
   private startTelemetryLoops(): void {
@@ -402,7 +489,6 @@ export class LiveSession {
     // Duration and emotional decay loop every 1 second
     if (this.sessionDurationIntervalId) clearInterval(this.sessionDurationIntervalId);
     this.sessionDurationIntervalId = window.setInterval(() => {
-      // Smoothly decay intense emotion toward neutral when inactive for >30s
       const now = Date.now();
       if (now - this.emotionState.updatedAt > 30000 && this.emotionState.intensity > 0.05) {
         this.emotionState.intensity = Math.max(0, this.emotionState.intensity - 0.02);

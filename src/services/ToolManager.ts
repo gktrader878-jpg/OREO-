@@ -2,6 +2,10 @@ import { ActiveTimer, EmotionState, EmotionType, FunctionCall, FunctionResponse,
 import { AppController } from './AppController';
 import { AppRegistry } from './AppRegistry';
 import { MemoryManager } from './MemoryManager';
+import { BrowserTools } from '../tools/browserTools';
+import { BrowserController } from '../browser/BrowserController';
+import { AgentEngine } from '../agent/AgentEngine';
+import { ComputerController } from '../agent/ComputerController';
 
 export type ToolEventListener = (event: {
   type: 'timer_added' | 'timer_finished' | 'website_opened' | 'tool_executed' | 'voice_change_requested' | 'emotion_changed' | 'workspace_updated' | 'memory_updated';
@@ -60,16 +64,56 @@ export class ToolManager {
 
       try {
         switch (call.name) {
+          case 'browserOpen':
+            output = BrowserTools.handleBrowserOpen(call.args);
+            break;
+
+          case 'browserSearch':
+            output = BrowserTools.handleBrowserSearch(call.args);
+            break;
+
+          case 'openWebsite':
+            output = BrowserTools.handleOpenWebsite(call.args);
+            break;
+
+          case 'searchWebsite':
+            output = BrowserTools.handleSearchWebsite(call.args);
+            break;
+
+          case 'openNewBrowserTab':
+            output = BrowserTools.handleOpenNewBrowserTab(call.args);
+            break;
+
+          case 'browserBack':
+            output = BrowserTools.handleBrowserBack();
+            break;
+
+          case 'browserForward':
+            output = BrowserTools.handleBrowserForward();
+            break;
+
+          case 'browserReload':
+            output = BrowserTools.handleBrowserReload();
+            break;
+
+          case 'browserNewTab':
+            output = BrowserTools.handleBrowserNewTab(call.args);
+            break;
+
+          case 'browserCloseTab':
+            output = BrowserTools.handleBrowserCloseTab(call.args);
+            break;
+
+          case 'browserSwitchTab':
+            output = BrowserTools.handleBrowserSwitchTab(call.args);
+            break;
+
           case 'openApp':
             output = this.handleOpenApp(call.args);
             break;
 
           case 'controlWorkspace':
             output = this.handleControlWorkspace(call.args);
-            break;
-
-          case 'openWebsite':
-            output = this.handleOpenWebsite(call.args);
             break;
 
           case 'setTimerOrReminder':
@@ -103,6 +147,87 @@ export class ToolManager {
           case 'clearMemory':
             output = await this.handleClearMemory(call.args);
             break;
+
+          case 'executeAgentGoal':
+            output = await this.handleExecuteAgentGoal(call.args);
+            break;
+
+          case 'getAgentStatus':
+            output = this.handleGetAgentStatus();
+            break;
+
+          case 'stopAgent':
+            output = this.handleStopAgent();
+            break;
+
+          case 'captureScreen': {
+            const cc = ComputerController.getInstance();
+            const res = await cc.captureScreen(call.args);
+            output = {
+              success: res.success,
+              width: res.width,
+              height: res.height,
+              sourceName: res.sourceName,
+              timestamp: res.timestamp,
+              hasImageData: Boolean(res.imageData),
+              message: res.success ? `Screen captured (${res.width}x${res.height})` : res.error,
+              error: res.error,
+            };
+            break;
+          }
+
+          case 'nativeMouseClick': {
+            const cc = ComputerController.getInstance();
+            output = await cc.click(call.args?.x || 500, call.args?.y || 300, call.args?.button || 'left', Boolean(call.args?.double));
+            break;
+          }
+
+          case 'nativeKeyboardType': {
+            const cc = ComputerController.getInstance();
+            output = await cc.type(call.args?.text || '');
+            break;
+          }
+
+          case 'nativeKeyPress': {
+            const cc = ComputerController.getInstance();
+            output = await cc.keyPress(call.args?.key || '', call.args?.modifiers || []);
+            break;
+          }
+
+          case 'nativeLaunchApp': {
+            const cc = ComputerController.getInstance();
+            output = await cc.launchNativeApp(call.args?.appNameOrPath || '');
+            break;
+          }
+
+          case 'readClipboard': {
+            const cc = ComputerController.getInstance();
+            const text = await cc.readClipboard();
+            output = { success: true, text };
+            break;
+          }
+
+          case 'writeClipboard': {
+            const cc = ComputerController.getInstance();
+            const ok = await cc.writeClipboard(call.args?.text || '');
+            output = { success: ok, copied: ok };
+            break;
+          }
+
+          case 'nativeMouseScroll': {
+            const cc = ComputerController.getInstance();
+            const deltaX = call.args?.deltaX || (call.args?.direction === 'left' ? -400 : call.args?.direction === 'right' ? 400 : 0);
+            const deltaY = call.args?.deltaY || (call.args?.direction === 'up' ? -400 : call.args?.direction === 'down' ? 400 : (call.args?.amount || 400));
+            output = await cc.scroll(deltaX, deltaY);
+            break;
+          }
+
+          case 'scrollBrowser':
+          case 'scrollPage':
+          case 'scroll': {
+            output = BrowserTools.handleBrowserScroll(call.args);
+            break;
+          }
 
           default:
             output = { error: `Tool ${call.name} is not recognized.` };
@@ -154,6 +279,13 @@ export class ToolManager {
 
     const appController = AppController.getInstance();
     const result = appController.openWebApp({
+      appName: rawAppName,
+      url: rawUrl,
+      mode: args.mode,
+    });
+
+    // Synchronize with integrated Browser Controller
+    BrowserController.getInstance().open({
       appName: rawAppName,
       url: rawUrl,
       mode: args.mode,
@@ -542,6 +674,45 @@ export class ToolManager {
     return {
       success: true,
       message: 'All stored long-term memories have been permanently cleared.',
+    };
+  }
+
+  private async handleExecuteAgentGoal(args: { goal?: string }): Promise<Record<string, any>> {
+    const goal = (args?.goal || '').trim();
+    if (!goal) {
+      return { success: false, message: 'Please provide a clear goal to execute.' };
+    }
+    const engine = AgentEngine.getInstance();
+    const finalResult = await engine.start(goal);
+    return {
+      success: finalResult.success,
+      summary: finalResult.summary,
+      completedStepsCount: finalResult.completedStepsCount,
+      failedStepsCount: finalResult.failedStepsCount,
+      warnings: finalResult.warnings,
+      message: finalResult.summary,
+    };
+  }
+
+  private handleGetAgentStatus(): Record<string, any> {
+    const engine = AgentEngine.getInstance();
+    const task = engine.getCurrentTask();
+    return {
+      status: engine.getStatus(),
+      activeGoal: task?.goal || null,
+      stepsCount: task?.steps.length || 0,
+      currentStepIndex: task?.currentStepIndex || 0,
+      isNeedsConfirmation: task?.status === 'needs_confirmation',
+    };
+  }
+
+  private handleStopAgent(): Record<string, any> {
+    const engine = AgentEngine.getInstance();
+    engine.stop();
+    return {
+      success: true,
+      status: 'cancelled',
+      message: 'Agent execution immediately halted and cancelled.',
     };
   }
 

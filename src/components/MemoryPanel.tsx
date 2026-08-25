@@ -20,10 +20,11 @@ import {
   Zap,
   Info,
   Clock,
-  Layers
+  Loader2,
+  Terminal
 } from 'lucide-react';
 import { MemoryCategory, MemoryItem, MemoryStats } from '../types';
-import { MemoryManager } from '../services/MemoryManager';
+import { MemoryDebugInfo, MemoryManager } from '../services/MemoryManager';
 
 interface MemoryPanelProps {
   isOpen: boolean;
@@ -47,6 +48,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
     },
     highImportanceCount: 0,
   });
+  const [debugInfo, setDebugInfo] = useState<MemoryDebugInfo | null>(null);
 
   const [activeCategory, setActiveCategory] = useState<MemoryCategory | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -59,6 +61,11 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
   const [editingMemory, setEditingMemory] = useState<MemoryItem | null>(null);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
+  // Saving state & error feedback
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [formError, setFormError] = useState<string | null>(null);
+
   // Form fields
   const [formKey, setFormKey] = useState('');
   const [formContent, setFormContent] = useState('');
@@ -69,11 +76,17 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
 
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
-  const loadData = async () => {
-    const all = await memoryManager.getAllMemories();
-    const st = await memoryManager.getStats();
-    setMemories(all);
-    setStats(st);
+  const loadData = () => {
+    try {
+      const all = memoryManager.getAllMemories();
+      const st = memoryManager.getStats();
+      const dbg = memoryManager.getDebugInfo();
+      setMemories(all);
+      setStats(st);
+      setDebugInfo(dbg);
+    } catch (err) {
+      console.error('[MemoryPanel] Error loading memory data:', err);
+    }
   };
 
   useEffect(() => {
@@ -83,7 +96,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
   }, [isOpen]);
 
   useEffect(() => {
-    const unsubscribe = memoryManager.subscribe((event) => {
+    const unsubscribe = memoryManager.subscribe(() => {
       loadData();
     });
     return () => unsubscribe();
@@ -92,7 +105,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
   // Flash action notification message
   const flashMessage = (msg: string) => {
     setActionMessage(msg);
-    setTimeout(() => setActionMessage(null), 3000);
+    setTimeout(() => setActionMessage(null), 3500);
   };
 
   // Filtered memory list
@@ -138,6 +151,9 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
     setFormImportance(0.8);
     setFormIsExplicit(true);
     setFormTags('');
+    setFormError(null);
+    setSaveStatus('idle');
+    setIsSaving(false);
     setIsAddModalOpen(true);
   };
 
@@ -149,91 +165,175 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
     setFormImportance(m.importance);
     setFormIsExplicit(m.isExplicit);
     setFormTags(m.tags?.join(', ') || '');
+    setFormError(null);
+    setSaveStatus('idle');
+    setIsSaving(false);
   };
 
-  const handleSaveAdd = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!formContent.trim()) return;
+  const handleSaveAdd = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
 
-    const tagsArray = formTags
-      .split(',')
-      .map((t) => t.trim().toLowerCase())
-      .filter((t) => t.length > 0);
+    const trimmedContent = formContent.trim();
+    if (!trimmedContent) {
+      setFormError('Memory content is required.');
+      return;
+    }
 
-    await memoryManager.addMemory({
-      content: formContent.trim(),
-      key: formKey.trim() || undefined,
-      category: formCategory,
-      importance: formImportance,
-      isExplicit: formIsExplicit,
-      tags: tagsArray,
-    });
+    if (isSaving) return;
 
-    setIsAddModalOpen(false);
-    flashMessage('Memory successfully saved to core.');
+    setFormError(null);
+    setIsSaving(true);
+    setSaveStatus('saving');
+
+    try {
+      const tagsArray = formTags
+        .split(',')
+        .map((t) => t.trim().toLowerCase())
+        .filter((t) => t.length > 0);
+
+      const title = formKey.trim();
+      const saved = memoryManager.saveMemory({
+        key: title || undefined,
+        title: title || undefined,
+        content: trimmedContent,
+        category: formCategory,
+        importance: formImportance,
+        isExplicit: formIsExplicit,
+        source: formIsExplicit ? 'explicit' : 'automatic',
+        tags: tagsArray,
+      });
+
+      loadData();
+      setSaveStatus('saved');
+      setIsSaving(false);
+
+      setTimeout(() => {
+        setIsAddModalOpen(false);
+        setSaveStatus('idle');
+        flashMessage(`Memory saved: "${saved.key || saved.content.slice(0, 24)}"`);
+      }, 350);
+    } catch (err: any) {
+      console.error('[OREO MEMORY] Save failed:', err);
+      setIsSaving(false);
+      setSaveStatus('error');
+      setFormError(err?.message || 'Unable to save memory.');
+    }
   };
 
-  const handleSaveEdit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingMemory || !formContent.trim()) return;
+  const handleSaveEdit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!editingMemory) return;
 
-    const tagsArray = formTags
-      .split(',')
-      .map((t) => t.trim().toLowerCase())
-      .filter((t) => t.length > 0);
+    const trimmedContent = formContent.trim();
+    if (!trimmedContent) {
+      setFormError('Memory content is required.');
+      return;
+    }
 
-    await memoryManager.updateMemory(editingMemory.id, {
-      content: formContent.trim(),
-      key: formKey.trim() || undefined,
-      category: formCategory,
-      importance: formImportance,
-      isExplicit: formIsExplicit,
-      tags: tagsArray,
-    });
+    if (isSaving) return;
 
-    setEditingMemory(null);
-    flashMessage('Memory updated.');
+    setFormError(null);
+    setIsSaving(true);
+    setSaveStatus('saving');
+
+    try {
+      const tagsArray = formTags
+        .split(',')
+        .map((t) => t.trim().toLowerCase())
+        .filter((t) => t.length > 0);
+
+      const title = formKey.trim();
+      const updated = memoryManager.updateMemory(editingMemory.id, {
+        content: trimmedContent,
+        key: title || undefined,
+        title: title || undefined,
+        category: formCategory,
+        importance: formImportance,
+        isExplicit: formIsExplicit,
+        source: formIsExplicit ? 'explicit' : 'automatic',
+        tags: tagsArray,
+      });
+
+      if (!updated) {
+        throw new Error('Memory could not be updated.');
+      }
+
+      loadData();
+      setSaveStatus('saved');
+      setIsSaving(false);
+
+      setTimeout(() => {
+        setEditingMemory(null);
+        setSaveStatus('idle');
+        flashMessage('Memory updated.');
+      }, 350);
+    } catch (err: any) {
+      console.error('[OREO MEMORY] Edit failed:', err);
+      setIsSaving(false);
+      setSaveStatus('error');
+      setFormError(err?.message || 'Unable to update memory.');
+    }
   };
 
   const handleDelete = async (id: string) => {
-    await memoryManager.deleteMemory(id);
-    flashMessage('Memory forgotten.');
+    try {
+      const success = await memoryManager.deleteMemory(id);
+      if (success) {
+        await loadData();
+        flashMessage('Memory deleted from database.');
+      } else {
+        flashMessage('Could not find memory to delete.');
+      }
+    } catch (err) {
+      console.error('[MemoryPanel] Delete memory failed:', err);
+      flashMessage('Failed to delete memory from database.');
+    }
   };
 
   const handleClearAll = async () => {
-    await memoryManager.clearMemory();
-    setConfirmClearOpen(false);
-    flashMessage('All long-term memories have been erased.');
+    try {
+      await memoryManager.clearMemory();
+      setConfirmClearOpen(false);
+      await loadData();
+      flashMessage('All long-term memories have been erased.');
+    } catch (err) {
+      console.error('[MemoryPanel] Clear memories failed:', err);
+      flashMessage('Failed to clear database memories.');
+    }
   };
 
   const handleExport = async () => {
-    const jsonStr = await memoryManager.exportJson();
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `oreo_memories_${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    flashMessage('Exported memory backup.');
+    try {
+      const jsonStr = await memoryManager.exportJson();
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `oreo_memories_${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      flashMessage('Exported memory backup.');
+    } catch (err) {
+      console.error('[MemoryPanel] Export failed:', err);
+      flashMessage('Export failed.');
+    }
   };
 
-  const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = async (evt) => {
-      try {
-        const text = evt.target?.result as string;
-        const count = await memoryManager.importJson(text);
-        flashMessage(`Imported ${count} memories.`);
-      } catch (err: any) {
-        flashMessage(`Import failed: ${err.message}`);
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = '';
+    try {
+      const text = await file.text();
+      const count = await memoryManager.importJson(text);
+      await loadData();
+      flashMessage(`Imported ${count} memories from backup.`);
+    } catch (err: any) {
+      console.error('[MemoryPanel] Import error:', err);
+      flashMessage('Failed to import JSON: Invalid format.');
+    } finally {
+      e.target.value = '';
+    }
   };
 
   const getCategoryBadgeClass = (category: MemoryCategory) => {
@@ -278,7 +378,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
                 </span>
               </div>
               <p className="text-xs text-zinc-400">
-                Persistent long-term memories curated selectively. Only what matters for future sessions.
+                Persistent long-term memories curated selectively. Stored securely in OREO_MEMORIES.
               </p>
             </div>
           </div>
@@ -381,10 +481,10 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
               <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/5 text-[11px] text-zinc-400 space-y-1.5">
                 <div className="flex items-center gap-1.5 text-cyan-400 font-semibold">
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>Selective Memory</span>
+                  <span>Verified Persistence</span>
                 </div>
                 <p className="text-[10px] leading-relaxed text-zinc-500">
-                  OREO only stores high-utility facts (projects, preferences, user name). Transient chatter is never saved.
+                  Every saved item is written and verified in OREO_MEMORIES storage. Memories persist across refreshes and browser restarts.
                 </p>
               </div>
             </div>
@@ -445,17 +545,20 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
               {filteredMemories.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center p-8 text-center text-zinc-500">
                   <Brain className="w-12 h-12 text-zinc-700 mb-3" />
-                  <h3 className="text-sm font-semibold text-zinc-300">No Memories Found</h3>
-                  <p className="text-xs max-w-sm mt-1 text-zinc-500">
+                  <h3 className="text-sm font-semibold text-zinc-300">
+                    {memories.length === 0 ? 'No saved memories yet' : 'No matching memories found'}
+                  </h3>
+                  <p className="text-xs max-w-sm mt-1 text-zinc-500 leading-relaxed">
                     {searchQuery
-                      ? `No memories matching "${searchQuery}".`
-                      : "No stored memories in this category yet. Speak to OREO: \"Remember that my project is called...\" or click Add Memory."}
+                      ? `No memories matching "${searchQuery}". Try clearing search filter.`
+                      : 'Speak to OREO: "Remember that my name is Siddharth" or click Add Memory to store durable knowledge.'}
                   </p>
                   <button
                     onClick={handleOpenAdd}
-                    className="mt-4 px-4 py-2 rounded-xl bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs font-medium hover:bg-cyan-500/30 transition-all"
+                    className="mt-4 px-5 py-2.5 rounded-xl bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs font-medium hover:bg-cyan-500/30 transition-all shadow-[0_0_15px_rgba(6,182,212,0.15)] flex items-center gap-1.5"
                   >
-                    Create New Memory
+                    <Plus className="w-4 h-4" />
+                    <span>Create New Memory</span>
                   </button>
                 </div>
               ) : (
@@ -534,7 +637,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
                                   style={{ width: `${importancePct}%` }}
                                 />
                               </div>
-                              <span className="font-mono text-zinc-400 text-[10px]">{importancePct}%</span>
+                              <span className="font-mono text-cyan-400 text-[10px]">{importancePct}%</span>
                             </div>
 
                             {/* Date */}
@@ -544,7 +647,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
                             </div>
 
                             {showDeveloperMeta && (
-                              <span className="font-mono text-[10px] text-zinc-600">
+                              <span className="font-mono text-[10px] text-zinc-500">
                                 ID: {m.id} | Access: {m.accessCount || 1}
                               </span>
                             )}
@@ -575,11 +678,49 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
               )}
             </div>
 
+            {/* Developer Metadata HUD Panel */}
+            {showDeveloperMeta && debugInfo && (
+              <div className="p-4 border-t border-cyan-500/20 bg-[#080d16] font-mono text-[11px] text-zinc-400 animate-fade-in space-y-2">
+                <div className="flex items-center justify-between text-cyan-400 font-bold">
+                  <div className="flex items-center gap-1.5">
+                    <Terminal className="w-3.5 h-3.5" />
+                    <span>OREO Memory Database Debug Inspector</span>
+                  </div>
+                  <span className="text-[10px] text-zinc-500">Auto-Refreshed</span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
+                  <div className="p-2 rounded-lg bg-black/40 border border-white/5">
+                    <div className="text-[10px] text-zinc-500 uppercase">Database</div>
+                    <div className="text-white font-semibold truncate">{debugInfo.databaseName}</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-black/40 border border-white/5">
+                    <div className="text-[10px] text-zinc-500 uppercase">Store / Count</div>
+                    <div className="text-cyan-300 font-semibold">{debugInfo.storeName} ({memories.length})</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-black/40 border border-white/5">
+                    <div className="text-[10px] text-zinc-500 uppercase">Last Operation</div>
+                    <div className="text-purple-300 font-semibold">{debugInfo.lastOperation}</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-black/40 border border-white/5">
+                    <div className="text-[10px] text-zinc-500 uppercase">Last Result</div>
+                    <div className={`font-semibold ${debugInfo.lastResult === 'SUCCESS' ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {debugInfo.lastResult}
+                    </div>
+                  </div>
+                </div>
+                {debugInfo.lastMemoryId && (
+                  <div className="text-[10px] text-zinc-500">
+                    Last Modified ID: <span className="text-zinc-300">{debugInfo.lastMemoryId}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Footer Status Bar with Dev Inspector Toggle */}
             <div className="px-6 py-3 border-t border-white/10 bg-[#090d14]/90 flex items-center justify-between text-xs text-zinc-500">
               <div className="flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
-                <span className="font-mono text-[11px] text-zinc-400">Storage: IndexedDB Active (Persistent)</span>
+                <span className="font-mono text-[11px] text-zinc-400">Storage: localStorage (OREO_MEMORIES) Active</span>
               </div>
 
               <button
@@ -595,71 +736,90 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
 
         {/* Add Memory Modal */}
         {isAddModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
-            <div className="w-full max-w-lg bg-[#0c1018] border border-cyan-500/30 rounded-3xl p-6 shadow-2xl space-y-4">
-              <div className="flex items-center justify-between pb-3 border-b border-white/10">
-                <div className="flex items-center gap-2">
-                  <Plus className="w-5 h-5 text-cyan-400" />
-                  <h3 className="text-base font-bold text-white">Add Long-Term Memory</h3>
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fade-in">
+            <div className="w-full max-w-lg bg-[#0b0f17] border border-cyan-500/30 rounded-3xl p-6 sm:p-7 shadow-[0_0_50px_rgba(6,182,212,0.15)] space-y-5">
+              <div className="flex items-center justify-between pb-3.5 border-b border-white/10">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+                    <Plus className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-white tracking-tight">Add Long-Term Memory</h3>
+                    <p className="text-[11px] text-zinc-400">Store durable preferences or facts into OREO's core memory.</p>
+                  </div>
                 </div>
                 <button
                   onClick={() => setIsAddModalOpen(false)}
-                  className="p-1 rounded-lg text-zinc-400 hover:text-white"
+                  disabled={isSaving}
+                  className="p-2 rounded-xl bg-white/5 border border-white/10 text-zinc-400 hover:text-white hover:bg-white/10 transition-all disabled:opacity-50"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
+              {/* Form validation or error banner */}
+              {formError && (
+                <div className="p-3 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-xs flex items-center gap-2 animate-fade-in">
+                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>{formError}</span>
+                </div>
+              )}
+
               <form onSubmit={handleSaveAdd} className="space-y-4">
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Label / Title (Optional)
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Memory Title / Label</span>
+                    <span className="text-[10px] text-zinc-500 font-mono font-normal">Optional</span>
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. Project Name, Preferred Theme, User Identity"
+                    placeholder="e.g. User Name, Project Name, Theme Preference"
                     value={formKey}
                     onChange={(e) => setFormKey(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-white/10 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all shadow-inner disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Category
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5">
+                    Category Classification
                   </label>
                   <select
                     value={formCategory}
                     onChange={(e) => setFormCategory(e.target.value as MemoryCategory)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#090d14] border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-[#0d121c] border border-white/15 text-xs text-white focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all cursor-pointer disabled:opacity-50"
                   >
-                    <option value="identity">User & Identity</option>
-                    <option value="preference">Preference</option>
-                    <option value="project">Project</option>
-                    <option value="instruction">Instruction</option>
-                    <option value="habit">Habit</option>
+                    <option value="identity">User & Identity (Name, Role, Background)</option>
+                    <option value="preference">Preference (UI, Mode, Tone, Style)</option>
+                    <option value="project">Project (Goals, Tech Stack, Notes)</option>
+                    <option value="instruction">Instruction (Standing rules & directives)</option>
+                    <option value="habit">Habit (Workflows, Patterns)</option>
                     <option value="context">Context & Other</option>
                   </select>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Memory Content *
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Memory Content *</span>
+                    <span className="text-[10px] text-cyan-400 font-mono">Durable Knowledge</span>
                   </label>
                   <textarea
                     rows={3}
-                    placeholder="e.g. User is building the OREO AI Assistant and prefers dark theme interfaces."
+                    placeholder="e.g. My name is Siddharth, and I am developing OREO with an anime-boy assistant voice."
                     value={formContent}
                     onChange={(e) => setFormContent(e.target.value)}
+                    disabled={isSaving}
                     required
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-white/10 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-500/50 resize-none"
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all resize-none shadow-inner leading-relaxed disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between text-xs font-semibold text-zinc-300 mb-1">
-                    <span>Importance Priority</span>
-                    <span className="font-mono text-cyan-400">{Math.round(formImportance * 100)}%</span>
+                  <div className="flex items-center justify-between text-xs font-semibold text-zinc-200 mb-1.5">
+                    <span>Retrieval Priority (Importance)</span>
+                    <span className="font-mono text-cyan-400 font-bold">{Math.round(formImportance * 100)}%</span>
                   </div>
                   <input
                     type="range"
@@ -668,49 +828,73 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
                     step="0.05"
                     value={formImportance}
                     onChange={(e) => setFormImportance(parseFloat(e.target.value))}
-                    className="w-full accent-cyan-400"
+                    disabled={isSaving}
+                    className="w-full accent-cyan-400 h-1.5 bg-zinc-800 rounded-lg cursor-pointer disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Tags (Comma separated)
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Tags</span>
+                    <span className="text-[10px] text-zinc-500 font-mono font-normal">Comma-separated</span>
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. theme, visual, dark-mode"
+                    placeholder="e.g. identity, name, preference, project"
                     value={formTags}
                     onChange={(e) => setFormTags(e.target.value)}
-                    className="w-full px-3.5 py-2 rounded-xl bg-white/5 border border-white/10 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all shadow-inner disabled:opacity-50"
                   />
                 </div>
 
-                <div className="flex items-center gap-2 pt-2">
+                <div className="flex items-center gap-2.5 p-3 rounded-xl bg-white/[0.03] border border-white/5">
                   <input
                     type="checkbox"
                     id="chk-explicit"
                     checked={formIsExplicit}
                     onChange={(e) => setFormIsExplicit(e.target.checked)}
-                    className="rounded accent-cyan-400"
+                    disabled={isSaving}
+                    className="w-4 h-4 rounded accent-cyan-400 cursor-pointer disabled:opacity-50"
                   />
                   <label htmlFor="chk-explicit" className="text-xs text-zinc-300 select-none cursor-pointer">
-                    Explicitly requested by user (High retrieval priority)
+                    Explicit command from user (High priority in voice context)
                   </label>
                 </div>
 
-                <div className="flex items-center justify-end gap-2 pt-3 border-t border-white/10">
+                <div className="flex items-center justify-end gap-2.5 pt-3.5 border-t border-white/10">
                   <button
                     type="button"
                     onClick={() => setIsAddModalOpen(false)}
-                    className="px-4 py-2 rounded-xl bg-white/5 border border-white/10 text-zinc-400 hover:text-white text-xs font-medium"
+                    disabled={isSaving}
+                    className="px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-zinc-300 hover:text-white hover:bg-white/10 text-xs font-medium transition-all disabled:opacity-50"
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2 rounded-xl bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30 text-xs font-semibold shadow-[0_0_15px_rgba(6,182,212,0.2)]"
+                    id="btn-save-memory-submit"
+                    disabled={isSaving}
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 border border-cyan-400/50 text-white hover:from-cyan-400 hover:to-blue-500 text-xs font-bold transition-all shadow-[0_0_20px_rgba(6,182,212,0.35)] flex items-center gap-2 active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    Save Memory
+                    {isSaving ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-200" />
+                    ) : saveStatus === 'saved' ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-300" />
+                    ) : saveStatus === 'error' ? (
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-300" />
+                    ) : (
+                      <Check className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {isSaving
+                        ? 'Saving...'
+                        : saveStatus === 'saved'
+                        ? 'Saved'
+                        : saveStatus === 'error'
+                        ? 'Save Failed - Retry'
+                        : 'Save Memory'}
+                    </span>
                   </button>
                 </div>
               </form>
@@ -720,69 +904,87 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
 
         {/* Edit Memory Modal */}
         {editingMemory && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
-            <div className="w-full max-w-lg bg-[#0c1018] border border-cyan-500/30 rounded-3xl p-6 shadow-2xl space-y-4">
-              <div className="flex items-center justify-between pb-3 border-b border-white/10">
-                <div className="flex items-center gap-2">
-                  <Edit2 className="w-5 h-5 text-cyan-400" />
-                  <h3 className="text-base font-bold text-white">Edit Memory</h3>
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fade-in">
+            <div className="w-full max-w-lg bg-[#0b0f17] border border-cyan-500/30 rounded-3xl p-6 sm:p-7 shadow-[0_0_50px_rgba(6,182,212,0.15)] space-y-5">
+              <div className="flex items-center justify-between pb-3.5 border-b border-white/10">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+                    <Edit2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-white tracking-tight">Edit Memory</h3>
+                    <p className="text-[11px] text-zinc-400">Modify stored knowledge in OREO's active core.</p>
+                  </div>
                 </div>
                 <button
                   onClick={() => setEditingMemory(null)}
-                  className="p-1 rounded-lg text-zinc-400 hover:text-white"
+                  disabled={isSaving}
+                  className="p-2 rounded-xl bg-white/5 border border-white/10 text-zinc-400 hover:text-white hover:bg-white/10 transition-all disabled:opacity-50"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
+              {formError && (
+                <div className="p-3 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-xs flex items-center gap-2 animate-fade-in">
+                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>{formError}</span>
+                </div>
+              )}
+
               <form onSubmit={handleSaveEdit} className="space-y-4">
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Label / Title
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Memory Title / Label</span>
+                    <span className="text-[10px] text-zinc-500 font-mono font-normal">Optional</span>
                   </label>
                   <input
                     type="text"
                     value={formKey}
                     onChange={(e) => setFormKey(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all shadow-inner disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Category
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5">
+                    Category Classification
                   </label>
                   <select
                     value={formCategory}
                     onChange={(e) => setFormCategory(e.target.value as MemoryCategory)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#090d14] border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-[#0d121c] border border-white/15 text-xs text-white focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all cursor-pointer disabled:opacity-50"
                   >
-                    <option value="identity">User & Identity</option>
-                    <option value="preference">Preference</option>
-                    <option value="project">Project</option>
-                    <option value="instruction">Instruction</option>
-                    <option value="habit">Habit</option>
+                    <option value="identity">User & Identity (Name, Role, Background)</option>
+                    <option value="preference">Preference (UI, Mode, Tone, Style)</option>
+                    <option value="project">Project (Goals, Tech Stack, Notes)</option>
+                    <option value="instruction">Instruction (Standing rules & directives)</option>
+                    <option value="habit">Habit (Workflows, Patterns)</option>
                     <option value="context">Context & Other</option>
                   </select>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Memory Content *
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Memory Content *</span>
+                    <span className="text-[10px] text-cyan-400 font-mono">Durable Knowledge</span>
                   </label>
                   <textarea
                     rows={3}
                     value={formContent}
                     onChange={(e) => setFormContent(e.target.value)}
+                    disabled={isSaving}
                     required
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-500/50 resize-none"
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all resize-none shadow-inner leading-relaxed disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between text-xs font-semibold text-zinc-300 mb-1">
-                    <span>Importance Priority</span>
-                    <span className="font-mono text-cyan-400">{Math.round(formImportance * 100)}%</span>
+                  <div className="flex items-center justify-between text-xs font-semibold text-zinc-200 mb-1.5">
+                    <span>Retrieval Priority (Importance)</span>
+                    <span className="font-mono text-cyan-400 font-bold">{Math.round(formImportance * 100)}%</span>
                   </div>
                   <input
                     type="range"
@@ -791,48 +993,71 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
                     step="0.05"
                     value={formImportance}
                     onChange={(e) => setFormImportance(parseFloat(e.target.value))}
-                    className="w-full accent-cyan-400"
+                    disabled={isSaving}
+                    className="w-full accent-cyan-400 h-1.5 bg-zinc-800 rounded-lg cursor-pointer disabled:opacity-50"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-zinc-300 mb-1">
-                    Tags (Comma separated)
+                  <label className="block text-xs font-semibold text-zinc-200 mb-1.5 flex items-center justify-between">
+                    <span>Tags</span>
+                    <span className="text-[10px] text-zinc-500 font-mono font-normal">Comma-separated</span>
                   </label>
                   <input
                     type="text"
                     value={formTags}
                     onChange={(e) => setFormTags(e.target.value)}
-                    className="w-full px-3.5 py-2 rounded-xl bg-white/5 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-500/50"
+                    disabled={isSaving}
+                    className="w-full px-4 py-2.5 rounded-xl bg-black/40 border border-white/15 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/50 transition-all shadow-inner disabled:opacity-50"
                   />
                 </div>
 
-                <div className="flex items-center gap-2 pt-2">
+                <div className="flex items-center gap-2.5 p-3 rounded-xl bg-white/[0.03] border border-white/5">
                   <input
                     type="checkbox"
                     id="chk-explicit-edit"
                     checked={formIsExplicit}
                     onChange={(e) => setFormIsExplicit(e.target.checked)}
-                    className="rounded accent-cyan-400"
+                    disabled={isSaving}
+                    className="w-4 h-4 rounded accent-cyan-400 cursor-pointer disabled:opacity-50"
                   />
                   <label htmlFor="chk-explicit-edit" className="text-xs text-zinc-300 select-none cursor-pointer">
-                    Explicitly requested by user
+                    Explicit command from user (High priority in voice context)
                   </label>
                 </div>
 
-                <div className="flex items-center justify-end gap-2 pt-3 border-t border-white/10">
+                <div className="flex items-center justify-end gap-2.5 pt-3.5 border-t border-white/10">
                   <button
                     type="button"
                     onClick={() => setEditingMemory(null)}
-                    className="px-4 py-2 rounded-xl bg-white/5 border border-white/10 text-zinc-400 hover:text-white text-xs font-medium"
+                    disabled={isSaving}
+                    className="px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-zinc-300 hover:text-white hover:bg-white/10 text-xs font-medium transition-all disabled:opacity-50"
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2 rounded-xl bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30 text-xs font-semibold shadow-[0_0_15px_rgba(6,182,212,0.2)]"
+                    disabled={isSaving}
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 border border-cyan-400/50 text-white hover:from-cyan-400 hover:to-blue-500 text-xs font-bold transition-all shadow-[0_0_20px_rgba(6,182,212,0.35)] flex items-center gap-2 active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    Update Memory
+                    {isSaving ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-200" />
+                    ) : saveStatus === 'saved' ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-300" />
+                    ) : saveStatus === 'error' ? (
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-300" />
+                    ) : (
+                      <Check className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {isSaving
+                        ? 'Saving...'
+                        : saveStatus === 'saved'
+                        ? 'Saved'
+                        : saveStatus === 'error'
+                        ? 'Save Failed - Retry'
+                        : 'Update Memory'}
+                    </span>
                   </button>
                 </div>
               </form>
@@ -849,7 +1074,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ isOpen, onClose }) => 
               </div>
               <h3 className="text-base font-bold text-white">Erase Long-Term Memory?</h3>
               <p className="text-xs text-zinc-400 leading-relaxed">
-                This will permanently delete all stored long-term preferences, project knowledge, and user facts from IndexedDB. This action cannot be undone.
+                This will permanently delete all stored long-term preferences, project knowledge, and user facts from OREO_MEMORIES storage. This action cannot be undone.
               </p>
               <div className="flex items-center justify-center gap-3 pt-3">
                 <button
